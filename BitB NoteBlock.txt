@@ -244,6 +244,6 @@ with open('/content/noVNC/index.html', 'w') as f:
 main_tunnel_proc, main_url = start_tunnel_and_wait(6080)
 
 if main_url:
-    print("\n✅ Open this link:", f"{main_url}/index.html")
+    print("\n✅ Open this link:", f"{main_url}")
 else:
     print("❌ Main tunnel failed to come up after multiple attempts. Re-run this cell.")
