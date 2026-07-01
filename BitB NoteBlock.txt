@@ -1,0 +1,249 @@
+import subprocess, time, os, re, requests, threading
+
+# ============ 1. System packages ============
+subprocess.run(['apt-get', 'update', '-qq'])
+subprocess.run(['apt-get', 'install', '-y', '-qq', 'xvfb', 'x11vnc', 'novnc', 'websockify',
+                 'fluxbox', 'wget', 'bzip2', 'libgtk-3-0', 'libdbus-glib-1-2', 'libxt6',
+                 'libasound2', 'x11-xserver-utils', 'xdotool'])
+
+# ============ 2. Real Firefox (bypass broken snap stub) ============
+def try_download(url, out):
+    subprocess.run(['wget', '-q', '-L', url, '-O', out])
+    result = subprocess.run(['file', out], capture_output=True, text=True)
+    return 'bzip2' in result.stdout
+
+fx_archive = '/content/firefox.tar.bz2'
+ok = try_download("https://download.mozilla.org/?product=firefox-latest&os=linux64&lang=en-US", fx_archive)
+if not ok:
+    print("Latest-redirect failed, falling back to pinned version 128.0...")
+    ok = try_download("https://ftp.mozilla.org/pub/firefox/releases/128.0/linux-x86_64/en-US/firefox-128.0.tar.bz2", fx_archive)
+if not ok:
+    raise RuntimeError("Firefox download failed both ways — check network access from Colab.")
+
+subprocess.run(['tar', 'xjf', fx_archive, '-C', '/opt/'], check=True)
+subprocess.run(['ln', '-sf', '/opt/firefox/firefox', '/usr/local/bin/firefox'])
+if subprocess.run(['which', 'firefox'], capture_output=True, text=True).stdout.strip() == '':
+    raise RuntimeError("Firefox binary not found after extraction.")
+print("Firefox installed OK.")
+
+# ============ 3. Pre-baked profile that skips ALL first-run screens ============
+profile_dir = '/content/ff_profile'
+os.makedirs(profile_dir, exist_ok=True)
+user_js = """
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.startup.page", 1);
+user_pref("browser.startup.homepage", "https://www.google.com");
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("startup.homepage_welcome_url", "");
+user_pref("startup.homepage_welcome_url.additional", "");
+user_pref("startup.homepage_override_url", "");
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.laterrun.enabled", false);
+user_pref("browser.rights.3.shown", true);
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("browser.tabs.warnOnClose", false);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
+user_pref("trailhead.firstrun.didSeeAboutWelcome", true);
+user_pref("browser.messaging-system.whatsNewPanel.enabled", false);
+user_pref("browser.newtabpage.activity-stream.feeds.section.topstories", false);
+"""
+with open(os.path.join(profile_dir, 'user.js'), 'w') as f:
+    f.write(user_js)
+
+# ============ 4. Virtual display (generous max size — 4K — so we can shrink to ANY real device) ============
+subprocess.Popen(['Xvfb', ':1', '-screen', '0', '3840x2160x24'])
+time.sleep(2)
+os.environ['DISPLAY'] = ':1'
+subprocess.Popen(['fluxbox'], env={**os.environ, 'DISPLAY': ':1'})
+time.sleep(2)
+
+# Immediately shrink to a sane default (1920x1080) before Firefox opens, so it doesn't render huge first
+subprocess.run(['xrandr', '--fb', '1920x1080'], env={**os.environ, 'DISPLAY': ':1'})
+time.sleep(1)
+
+# ============ 5. Launch Firefox in kiosk mode, straight to google.com ============
+fx_log = open('/content/firefox.log', 'w')
+fx = subprocess.Popen(
+    ['firefox', '--no-remote', '--new-instance', '-profile', profile_dir,
+     '-kiosk', 'https://web.whatsapp.com'],
+    env={**os.environ, 'DISPLAY': ':1'},
+    stdout=fx_log, stderr=subprocess.STDOUT
+)
+time.sleep(8)
+if fx.poll() is not None:
+    fx_log.close()
+    print(open('/content/firefox.log').read())
+    raise RuntimeError("Firefox crashed on startup — log printed above.")
+print("Firefox running in kiosk mode, google.com loaded: True")
+
+# ============ 6. VNC + noVNC ============
+subprocess.Popen(['x11vnc', '-display', ':1', '-forever', '-shared', '-rfbport', '5900',
+                   '-nopw', '-xrandr'])
+time.sleep(2)
+subprocess.run(['git', 'clone', '--quiet', 'https://github.com/novnc/noVNC.git', '/content/noVNC'])
+subprocess.run(['git', 'clone', '--quiet', 'https://github.com/novnc/websockify', '/content/noVNC/utils/websockify'])
+subprocess.Popen(['/content/noVNC/utils/novnc_proxy', '--vnc', 'localhost:5900', '--listen', '6080'])
+time.sleep(3)
+
+# ============ 7. Resize backend: real xrandr resize + force Firefox window to match ============
+resize_server_code = '''
+import subprocess, os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
+
+ENV = {**os.environ, "DISPLAY": ":1"}
+
+class ResizeHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/resize":
+            qs = parse_qs(parsed.query)
+            w = qs.get("w", [None])[0]
+            h = qs.get("h", [None])[0]
+            if w and h:
+                try:
+                    w, h = int(float(w)), int(float(h))
+                    subprocess.run(["xrandr", "--fb", f"{w}x{h}"], env=ENV, check=False)
+                    # force firefox window to exactly cover the new screen size
+                    ids = subprocess.run(
+                        ["xdotool", "search", "--class", "Firefox"],
+                        env=ENV, capture_output=True, text=True
+                    ).stdout.split()
+                    for wid in ids:
+                        subprocess.run(["xdotool", "windowsize", wid, str(w), str(h)], env=ENV, check=False)
+                        subprocess.run(["xdotool", "windowmove", wid, "0", "0"], env=ENV, check=False)
+                    self.send_response(200)
+                except Exception:
+                    self.send_response(500)
+            else:
+                self.send_response(400)
+        else:
+            self.send_response(404)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+HTTPServer(("127.0.0.1", 6081), ResizeHandler).serve_forever()
+'''
+with open('/content/resize_server.py', 'w') as f:
+    f.write(resize_server_code)
+subprocess.Popen(['python3', '/content/resize_server.py'])
+time.sleep(1)
+print("Resize backend running on :6081")
+
+# ============ 8. cloudflared binary ============
+subprocess.run(['wget', '-q', 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64', '-O', '/content/cloudflared'])
+subprocess.run(['chmod', '+x', '/content/cloudflared'])
+
+def start_tunnel_and_wait(local_port, max_attempts=4, dns_wait_timeout=45):
+    for attempt in range(1, max_attempts + 1):
+        print(f"[tunnel:{local_port}] attempt {attempt}/{max_attempts}...")
+        proc = subprocess.Popen(
+            ['/content/cloudflared', 'tunnel', '--url', f'http://localhost:{local_port}'],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        url = None
+        for _ in range(60):
+            line = proc.stdout.readline()
+            if not line:
+                time.sleep(0.5)
+                continue
+            match = re.search(r'https://[a-zA-Z0-9\-]+\.trycloudflare\.com', line)
+            if match:
+                url = match.group(0)
+                break
+        if not url:
+            proc.terminate()
+            continue
+        deadline = time.time() + dns_wait_timeout
+        while time.time() < deadline:
+            try:
+                r = requests.get(url, timeout=5)
+                if r.status_code < 500:
+                    print(f"[tunnel:{local_port}] live: {url}")
+                    return proc, url
+            except requests.exceptions.RequestException:
+                pass
+            time.sleep(3)
+        proc.terminate()
+    return None, None
+
+# Tunnel #1: resize backend (must exist before we can reference it in index.html)
+resize_tunnel_proc, resize_url = start_tunnel_and_wait(6081)
+if not resize_url:
+    raise RuntimeError("Resize tunnel failed to come up.")
+
+# ============ 9. Custom client page — asks server for its REAL size first, then connects ============
+custom_html = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Whatsapp</title>
+<head>
+  <link rel="icon" type="image/png" href="https://img.icons8.com/?size=48&id=AltfLkFSP7XN&format=png">
+</head>
+<style>
+  html, body {{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#fff; }}
+  #screen {{ width:100vw; height:100dvh; overflow:hidden; }}
+  canvas {{ display:block; }} /* native resolution, matches real device size — no scale, no crop */
+</style>
+</head>
+<body>
+<div id="screen"></div>
+<script type="module">
+  import RFB from './core/rfb.js';
+
+  const RESIZE_BASE = "{resize_url}";
+  const host = window.location.hostname;
+  const port = window.location.port || (window.location.protocol === 'https:' ? 443 : 80);
+  const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  const wsUrl = proto + '://' + host + (port ? ':' + port : '') + '/websockify';
+
+  const screen = document.getElementById('screen');
+  let rfb;
+
+  async function setServerSize() {{
+    const w = Math.round(window.innerWidth);
+    const h = Math.round(window.innerHeight);
+    try {{
+      await fetch(`${{RESIZE_BASE}}/resize?w=${{w}}&h=${{h}}`);
+    }} catch (e) {{}}
+  }}
+
+  async function connect() {{
+    await setServerSize();
+    await new Promise(r => setTimeout(r, 900)); // let X + Firefox settle into new size
+    rfb = new RFB(screen, wsUrl);
+    rfb.viewOnly = false;
+    rfb.scaleViewport = false;
+    rfb.resizeSession = false; // we handle resizing ourselves via xrandr backend
+    rfb.addEventListener('disconnect', () => setTimeout(connect, 1000));
+  }}
+  connect();
+
+  let resizeTimer;
+  window.addEventListener('resize', () => {{
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(async () => {{
+      await setServerSize();
+      if (rfb) {{ rfb.disconnect(); }} // reconnect to pick up fresh framebuffer size cleanly
+    }}, 300);
+  }});
+</script>
+</body>
+</html>
+"""
+with open('/content/noVNC/index.html', 'w') as f:
+    f.write(custom_html)
+
+# Tunnel #2: the actual noVNC/browser page
+main_tunnel_proc, main_url = start_tunnel_and_wait(6080)
+
+if main_url:
+    print("\n✅ Open this link:", f"{main_url}/index.html")
+else:
+    print("❌ Main tunnel failed to come up after multiple attempts. Re-run this cell.")
