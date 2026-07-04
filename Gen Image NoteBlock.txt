@@ -1,3 +1,4 @@
+# https://colab.research.google.com/github/lllyasviel/Fooocus/blob/main/fooocus_colab.ipynb
 !pip install "numpy<2.0" cupy-cuda12x --upgrade -q
 
 !pip install pygit2==1.15.1
